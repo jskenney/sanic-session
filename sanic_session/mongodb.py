@@ -113,7 +113,7 @@ class MongoDBSessionInterface(BaseSessionInterface):
         _SessionModel.__coll__ = coll
 
         @app.listener("after_server_start")
-        async def apply_session_indexes(app, loop):
+        async def apply_session_indexes(app):
             """Create indexes in session collection
             if doesn't exist.
 
