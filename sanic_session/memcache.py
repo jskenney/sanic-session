@@ -24,6 +24,8 @@ class MemcacheSessionInterface(BaseSessionInterface):
         samesite: str = "Lax",
         session_name: str = "session",
         secure: bool = True,
+        refresh_interval: float = None,
+        cas: bool = False,
     ):
         """Initializes the interface for storing client sessions in memcache.
         Requires a client object established with `aiomcache`.
@@ -63,6 +65,15 @@ class MemcacheSessionInterface(BaseSessionInterface):
                 Default: 'session'
             secure (bool, optional):
                 Adds the `Secure` flag to the session cookie (default True).
+            refresh_interval (float, optional):
+                Seconds after which an unchanged session is written again
+                (renewing its store expiry and cookie), so active sessions
+                do not expire.  Default: a tenth of ``expiry``; 0 never.
+            cas (bool, optional):
+                Save with memcached check-and-set: when another request
+                saved the session since this one read it, the change is not
+                written and the response is a 409 (default False: the last
+                save wins).
         """
         if aiomcache is None:
             raise RuntimeError(
@@ -71,6 +82,7 @@ class MemcacheSessionInterface(BaseSessionInterface):
             )
 
         self.memcache_connection = memcache_connection
+        self.cas = cas
 
         if expiry and expiry > MEMCACHE_MAX_TTL:
             warnings.warn(
@@ -90,14 +102,14 @@ class MemcacheSessionInterface(BaseSessionInterface):
             samesite=samesite,
             session_name=session_name,
             secure=secure,
+            refresh_interval=refresh_interval,
         )
 
     def _store_ttl(self):
         return min(self.expiry, MEMCACHE_MAX_TTL) if self.expiry else 0
 
-    async def _get_value(self, prefix, sid):
-        key = (self.prefix + sid).encode()
-        value = await self.memcache_connection.get(key)
+    async def _get_value(self, key):
+        value = await self.memcache_connection.get(key.encode())
         return value.decode() if value else None
 
     async def _delete_key(self, key):
@@ -106,4 +118,17 @@ class MemcacheSessionInterface(BaseSessionInterface):
     async def _set_value(self, key, data):
         return await self.memcache_connection.set(
             key.encode(), data.encode(), exptime=self._store_ttl()
+        )
+
+    async def _load(self, key):
+        if not self.cas:
+            return await super()._load(key)
+        value, token = await self.memcache_connection.gets(key.encode())
+        return (value.decode() if value else None), token
+
+    async def _store(self, key, data, token):
+        if not self.cas or token is None:
+            return await super()._store(key, data, token)
+        return await self.memcache_connection.cas(
+            key.encode(), data.encode(), token, exptime=self._store_ttl()
         )

@@ -10,7 +10,7 @@ format: ## format code
 	ruff format sanic_session tests example
 
 test: ## run tests (memcached tests need memcached on 127.0.0.1:11211)
-	pytest -v tests
+	pytest -v --cov=sanic_session --cov-report=term-missing tests
 
 build: ## build sdist and wheel into dist/
 	python -m pip install --upgrade build
