@@ -79,33 +79,50 @@ class CallbackDict(UpdateDictMixin, dict):
         return "<%s %s>" % (self.__class__.__name__, dict.__repr__(self))
 
 
-class ExpiringDict(dict):
-    def __init__(self, prefix=""):
-        self.prefix = prefix
-        super().__init__()
-        self.expiry_times = {}
+class ExpiringDict:
+    """A store whose entries expire.
 
-    def set(self, key: Union[str, int], val: Any, expiry: int):
-        self[key] = val
-        self.expiry_times[key] = time.time() + expiry
+    Lookups are O(1).  Expired entries are removed when they are read, and
+    all of them at most every ``purge_interval`` seconds (checked on ``set``),
+    so abandoned entries do not accumulate.
+    """
 
-    def get_by_sid(self, key: str):
-        key = self.prefix + key
-        return self.get(key)
+    def __init__(self, purge_interval: float = 60):
+        self._data = {}  # key -> (value, expires_at or None for no expiry)
+        self.purge_interval = purge_interval
+        self._next_purge = time.monotonic() + purge_interval
+
+    def set(self, key: Union[str, int], val: Any, expiry: Union[int, None]):
+        """Store ``val`` for ``expiry`` seconds (0 or None: no expiry)."""
+        expires_at = time.monotonic() + expiry if expiry else None
+        self._data[key] = (val, expires_at)
+        if time.monotonic() >= self._next_purge:
+            self.purge()
 
     def get(self, key: Union[str, int]):
-        data = dict(self).get(key)
-
-        if not data:
+        """Return the stored value, or None if missing or expired."""
+        item = self._data.get(key)
+        if item is None:
             return None
-
-        if time.time() > self.expiry_times[key]:
-            del self[key]
-            del self.expiry_times[key]
+        val, expires_at = item
+        if expires_at is not None and time.monotonic() > expires_at:
+            del self._data[key]
             return None
-
-        return data
+        return val
 
     def delete(self, key: Union[str, int]):
-        del self[key]
-        del self.expiry_times[key]
+        self._data.pop(key, None)
+
+    def purge(self):
+        """Remove every expired entry."""
+        now = time.monotonic()
+        self._data = {
+            k: v for k, v in self._data.items() if v[1] is None or v[1] >= now
+        }
+        self._next_purge = now + self.purge_interval
+
+    def __contains__(self, key):
+        return self.get(key) is not None
+
+    def __len__(self):
+        return len(self._data)
