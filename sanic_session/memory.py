@@ -14,13 +14,14 @@ class InMemorySessionInterface(BaseSessionInterface):
         samesite: str = "Lax",
         session_name="session",
         secure: bool = True,
+        refresh_interval: float = None,
     ):
         """Initializes the interface for storing client sessions in the
         server process (not shared between workers, lost on restart: for
         testing and development).
 
         Takes the same options as MemcacheSessionInterface, without the
-        memcached client; ``expiry`` 0 or None keeps sessions until the
+        memcached client and ``cas``; ``expiry`` 0 or None keeps sessions until the
         browser closes, with no expiry in the store.
         """
         super().__init__(
@@ -33,11 +34,12 @@ class InMemorySessionInterface(BaseSessionInterface):
             samesite=samesite,
             session_name=session_name,
             secure=secure,
+            refresh_interval=refresh_interval,
         )
         self.session_store = ExpiringDict()
 
-    async def _get_value(self, prefix, sid):
-        return self.session_store.get(self.prefix + sid)
+    async def _get_value(self, key):
+        return self.session_store.get(key)
 
     async def _delete_key(self, key):
         self.session_store.delete(key)

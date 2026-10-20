@@ -25,3 +25,13 @@ SessionStoreError
 -----------------------------------------------
 
 .. autoclass:: sanic_session.SessionStoreError
+
+SessionConflictError
+-----------------------------------------------
+
+.. autoclass:: sanic_session.SessionConflictError
+
+SessionSerializationError
+-----------------------------------------------
+
+.. autoclass:: sanic_session.SessionSerializationError

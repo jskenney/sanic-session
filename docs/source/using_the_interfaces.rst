@@ -5,7 +5,7 @@ Using the interfaces
 
 Install the memcached driver with the ``aiomcache`` extra::
 
-    pip install "sanic-session[aiomcache] @ git+https://github.com/jskenney/sanic-session@v0.9.0"
+    pip install "sanic-session[aiomcache] @ git+https://github.com/jskenney/sanic-session@v0.10.0"
 
 Memcache
 -----------------

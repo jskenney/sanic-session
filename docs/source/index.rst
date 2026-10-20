@@ -12,7 +12,7 @@ sanic_session
 
 sanic_session is an extension for Sanic that integrates server-backed sessions with a dict-like API.
 
-Install it with pip: :code:`pip install "sanic-session[aiomcache] @ git+https://github.com/jskenney/sanic-session@v0.9.0"`
+Install it with pip: :code:`pip install "sanic-session[aiomcache] @ git+https://github.com/jskenney/sanic-session@v0.10.0"`
 
 Sessions can be stored in:
 
