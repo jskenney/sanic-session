@@ -1,180 +1,165 @@
-# sanic-session fork: Review for use with modular-sanic
+# sanic-session fork: Review (second pass, v0.9.0)
 
-Reviewed at `f1494fb` on main, 2026-10-20. The review covers the fork itself, and what it needs so that [modular-sanic](https://github.com/jskenney/modular-sanic) (at `deba8a1`) can rely on it rather than working around it. No code was changed. This file is the only addition.
+Reviewed: `main` / tag `v0.9.0` at `fbcb14c` (2026-10-20). That is fix batch 5 (#1); there are no newer commits on this repository.
 
-**How it was reviewed:**
-- I read every source, test, packaging and CI file, and the modular-sanic code that uses the fork.
-- I ran the test suite, `ruff`, and a normal `pip install` on Python 3.13.
-- I ran a small Sanic 25.12.1 app on the memcached and in-memory backends against real memcached 1.6, and tested it with `curl`.
+This pass focuses on **performance, bugs, runtime errors, architecture/design, and project health**, for use with modular-sanic.
 
-Findings marked **[verified]** were reproduced that way.
+Tags:
+- **[verified]**: reproduced with Sanic 25.12.1, either through modular-sanic's live instance or a small sanic-testing app.
+- **[measured]**: has numbers.
+- **[reasoned]**: from reading the code.
 
----
+No package code was changed.
 
-## 1. What the fork is, and how modular-sanic uses it
+## 1. What the fork is now
 
-**History.** The fork is upstream `sanic-session` 0.8.0 (Adam Hopkins' last commit was 2022-12-27) plus two commits:
-- `f77201b` (2024): Sanic's new cookie API (`response.add_cookie`, cookie attributes instead of dict access), from a community fix;
-- `f1494fb` (2025): drops the removed `loop` argument from the MongoDB listener.
+There are 5 modules, about 450 lines:
 
-**Structure.**
+- **`base.py`:**
+  - `SessionDict` is a `CallbackDict` that sets `modified` on top-level changes;
+  - `BaseSessionInterface` provides `open`, `regenerate`, `save` and the cookie helpers.
+- **`memcache.py`:** aiomcache, with the TTL capped at 30 days.
+- **`memory.py`:** `ExpiringDict`.
+- **`__init__.py`:** `Session` registers two middleware:
+  - open at request priority 1000;
+  - save at response priority -1000;
+  - a `SessionStoreError` in save is turned into a plain-text 503.
 
-| File | Role |
-|---|---|
-| `__init__.py` | `Session(app, interface)` registers two middlewares by pushing onto `app.request_middleware` / `app.response_middleware`, and imports every backend |
-| `base.py` | `SessionDict` (a dict with a `modified` flag), `BaseSessionInterface.open()` (cookie → stored JSON → `request.ctx.session`) and `save()` (JSON → store, then `Set-Cookie`) |
-| `memcache.py`, `memory.py` | The two backends modular-sanic uses: aiomcache, and an in-process `ExpiringDict` |
-| `redis.py`, `aioredis.py`, `mongodb.py` | Other backends (asyncio_redis, aioredis 1.x/2.x, sanic_motor) |
-| `utils.py` | `CallbackDict` (sets `modified`) and `ExpiringDict` |
-
-**How modular-sanic uses it** (`server.py` on its `main`):
-- It creates `MemcacheSessionInterface` or `InMemorySessionInterface` with `cookie_name="__Host-session"`, `secure=True`, a configurable `samesite`, and `expiry=min(AUTH_VALID, 2592000)` (`server.py:42`). That cap exists only because of H-1 below.
-- It subclasses both interfaces with a `SaveWhenModified` mixin that skips `save()` for unmodified sessions (`server.py:47-52`). That is a workaround for M-1.
-- It rotates the session ID on every logon or user switch by reaching into private internals (`server.py:386-389`): `request.app.ctx.extensions['session'].interface`, `interface._delete_key(interface.prefix + session.sid)`, then assigning `session.sid` and `session.modified`. This is the gap behind H-4.
-- It installs the fork as `sanic_session@git+https://github.com/jskenney/sanic-session` with no tag or commit pinned (`requirements.txt:16`), and needs `pip install --no-build-isolation` (`start.sh:16`) because of H-3.
-
----
+**Request flow:**
+1. **open:** read the cookie; if it is a 32-hex id, `get` it from the store; a missing or bad entry gives a new id.
+2. **handler.**
+3. **save:** only when `modified`. An empty session is deleted and its cookie removed. Otherwise the whole dict is written as JSON and `Set-Cookie` is sent.
 
 ## 2. Tool and test results
 
 | Check | Result |
 |---|---|
-| `pytest tests` | **21 failed, 18 passed, 1 error.** 10 tests still read cookies dict-style (`TypeError: 'CookieJar' object is not subscriptable`). 11 Redis tests fail because `asyncio_redis` isn't installed. The error is a missing `event_loop` fixture, removed from pytest-asyncio. |
-| GitHub Actions | **No runs have ever been recorded on the fork.** Forks start with workflows disabled. The workflow targets Python 3.7–3.11 with `actions/*@v2`. Python 3.7 isn't available on current `ubuntu-latest`. |
-| `ruff --select E,F,W,B` | 2 × B028 (`warnings.warn` without `stacklevel`). |
-| `pip install .` (Python 3.13) | **Fails:** `BackendUnavailable: Cannot import 'setuptools.build_meta'`. It only installs with `--no-build-isolation` and setuptools already present. |
-| Installed metadata | `Version: 0.8.0` (the same as upstream on PyPI), `Home-page: http://github.com/subyraman/sanic_session`. No tags exist. |
-
----
+| `pytest` (46 tests, memory and memcached) | All pass. One DeprecationWarning, from `websockets.legacy` inside Sanic, not from this package. |
+| `ruff check sanic_session tests` | Clean. |
+| GitHub Actions "Tests" (Python 3.10–3.14 with a memcached service) | Green on `fixes-batch-5`, `main` and `v0.9.0` (runs 1–4). |
+| modular-sanic regression probes with v0.9.0 | Passing, apart from fixture gaps; see modular-sanic REVIEW.md §2. |
+| Store traffic (modular-sanic, memcached stats) | 0 sets for requests that don't change the session (was 1 per response before v0.9.0). 1 `get` for **every** request carrying the cookie, including static files. |
 
 ## 3. Findings
 
 ### HIGH
 
-#### H-1. "Permanent" sessions, and memcached sessions longer than 30 days, are deleted immediately **[verified]**
-- `base.py:69-71` sends `Max-Age=self.expiry`.
-- The docs (`docs/source/configuration.rst`) say `expiry=0` makes a session permanent. In practice `expiry=0` sends **`Max-Age=0`**, which tells the browser to delete the cookie at once. This happens with both memcached and in-memory.
-- With the in-memory backend, `expiry=0` also stores the session as already expired (`utils.py:90`), so the next request sees `{}`.
-- `memcache.py:70-72` turns any `expiry` over 30 days into `0`, again producing `Max-Age=0`. modular-sanic hit this with `AUTH_VALID=3000000` (everyone logged out at once) and now caps the value itself.
+#### H-1. In-place changes to nested values are silently lost **[verified]**
 
-**Fix.**
-- Treat `expiry=0`/`None` as "no expiry": send a session cookie (no `Max-Age`/`Expires`) and store with no TTL (memcached `exptime=0`).
-- For memcached, cap the **store** TTL at 2,592,000 seconds but keep the requested `Max-Age` on the cookie.
-- Never send `Max-Age=0` except when deleting.
+"Save only when modified" (v0.9.0, M-1) relies on `CallbackDict`, which only sees **top-level** changes such as `__setitem__`, `pop` and `update`. Code like this changes the stored list without the dict noticing:
 
-#### H-2. Backend and input problems become 500 errors, or silently lost sessions **[verified]**
-- `base.py:121-133`: the cookie value goes straight into a memcached key. A cookie containing a space (`session="a b"`), or longer than 250 characters, makes aiomcache raise `ValidationException`, and **every request from that browser gets a 500**, including static pages.
-- `base.py:130`: a corrupt stored value (`ujson.loads`) also gives a 500.
-- **When memcached is down**, any request that carries a session cookie gives a 500.
-- Worse, a session **write** fails silently: `save()` runs in response middleware, Sanic logs the exception, and the client gets **200 with no `Set-Cookie`**. A logon therefore "succeeds" while the session is lost. modular-sanic's logon endpoints can't detect this.
+```python
+cart = request.ctx.session.setdefault("cart", [])
+cart.append(item)                      # or session["prefs"]["theme"] = "dark"
+```
 
-**Fix.**
-- Validate the cookie before use: for example, accept only 32 lowercase hex characters, otherwise treat it as absent.
-- Treat read errors (connection errors, bad JSON) as an empty session and log them, instead of raising.
-- Make write failures visible. One option is a `save()` that raises a specific `SessionStoreError` the app can turn into a 503. Another is a `strict=True` mode that saves before the handler returns (for example, an awaitable `await request.ctx.session.save_now()` that logon endpoints can call).
+So `modified` stays False and nothing is written.
 
-#### H-3. Packaging blocks a normal install, the package can crash on import, and it can't be pinned **[verified]**
-- `pyproject.toml:2` requires `setuptools<60`, which can't build on Python ≥3.12. modular-sanic's `start.sh`, and the Docker image, need `--no-build-isolation` because of this.
-- `__init__.py:1-5` imports every backend. `aioredis.py:3-6` only catches `ImportError`. If `aioredis` 2.0.1 is installed (for example, pulled in by another package), **`import sanic_session` fails** on Python 3.11+ with `TypeError: duplicate base class TimeoutError`, and modular-sanic can't start.
-- The version is still `0.8.0` (`setup.py:36`), the same as the upstream release on PyPI, and no tags exist. modular-sanic installs whatever the fork's HEAD is at install time, so builds aren't reproducible.
+**Reproduced through modular-sanic with a two-route extension:**
+- the first `/api/cart/add` returns `[1]` (the key is new, so the session saves);
+- the second returns `[1, 2]`, but `/api/cart/show` then returns `[1]`.
 
-**Fix.**
-- Use `requires = ["setuptools>=61", "wheel"]`, and move the metadata into `pyproject.toml` (`requires-python = ">=3.10"`).
-- Catch `Exception` (not just `ImportError`) around optional driver imports, or import backends lazily.
-- Bump to a distinct version (for example `0.9.0`), tag it, and pin modular-sanic to `@v0.9.0`.
+The handler sees the change, the client is told it worked, and it is gone on the next request.
 
-#### H-4. Client-chosen session IDs are accepted, and there is no supported way to change the ID **[verified]**
-`base.py:121-133` accepts any cookie value as the session ID, even one that was never issued, and `save()` stores data under it. A request with `Cookie: session=attacker-chosen` got its data stored under `session:attacker-chosen` and the same ID echoed back. modular-sanic closes the session-fixation hole by changing the ID at logon, but it has to use private attributes to do so (section 1).
+Before v0.9.0 this worked, because every response rewrote the store. It is a silent data-loss regression for any extension that keeps lists or dicts in the session. modular-sanic's own code only assigns top-level keys, so it isn't affected.
 
-**Fix.**
-- When the cookie's ID has no stored value, issue a new random ID.
-- Add a public `async def regenerate(self, request)` on the interface (delete the old key, assign a new ID, mark the session modified), or `request.ctx.session.regenerate()`.
+**Fix (small, keeps the write savings):**
+1. In `open()`, keep the raw stored string on the session (`session_dict._loaded = val`).
+2. In `save()`, serialize first. Write when `session.modified` **or** `val != session._loaded`. Skip only when both say unchanged.
+
+This costs one `json.dumps` per request that has a stored session (microseconds for typical sessions) and no extra store traffic. Add a test for `setdefault(...).append(...)` and for nested-dict changes, for both backends.
 
 ### MEDIUM
 
-#### M-1. The store is written on every response, even when nothing changed **[verified]**
-`base.py:158-168`:
-- **Unchanged sessions:** for a request carrying a valid session, `save()` rewrites the session and re-sends `Set-Cookie` even when nothing changed. One `/static` request caused one memcached `set` and one `Set-Cookie`.
-- **No session at all:** for a request with no cookie, `save()` sends a memcached `DELETE` for the brand-new, never-stored ID. 20 cookie-less requests caused 20 `delete_misses`.
+#### M-1. The 503 for a store write failure skips the app's response middleware, and reveals a successful logon **[verified]**
 
-On a busy site, every static file costs a memcached round trip. modular-sanic's `SaveWhenModified` mixin avoids both.
+`__init__.py:44-57`. `save_session` runs first among the response middleware (priority -1000) and **returns a new response**, so Sanic runs no further response middleware.
 
-**Fix.** Save only when `session.modified`. Skip the delete when the session was never stored (track whether `open()` found a value). If sliding expiry is wanted, add an option that refreshes the TTL and cookie at most once per interval.
+With memcached stopped, modular-sanic's 503 had only `content-length`, `connection` and `content-type`. It had:
+- no `Content-Security-Policy`;
+- no `X-Frame-Options`;
+- no `nosniff`;
+- no HSTS.
 
-#### M-2. The in-memory backend never removes expired sessions, and lookups copy the whole store **[verified]**
-- `utils.py:96-97`: `ExpiringDict.get()` runs `dict(self).get(key)`, which copies the entire store on every lookup. That took **1.2 ms per request at 100,000 sessions**, versus 0.005 ms at 1,000.
-- Expired entries are removed only when that exact key is read again. After 20,000 sessions with `expiry=1` had expired, **all 20,000 were still held**.
-- modular-sanic falls back to this backend when memcached is unavailable, and each anonymous visit to a logon page creates a session (`motd`). Memory therefore grows without limit, and requests slow down as it does.
+It is also plain text where the app speaks JSON.
 
-**Fix.** Use `super().get(key)`. Purge expired entries periodically, or on `set()` every N inserts, for example with a min-heap or an ordered dict keyed by expiry. Optionally cap the number of entries.
+The 503 only happens when the handler changed the session, so it tells a client that its request succeeded. For a logon, that turns an outage into a password oracle; see modular-sanic H-1.
 
-#### M-3. Deleting a cookie ignores its domain and path **[verified]**
-`base.py:51-52` calls `response.delete_cookie(self.cookie_name)`, with no domain or path. A cookie set with `domain="example.test"` was "deleted" with a cookie that had no `Domain`, so browsers keep the original and the user stays logged on after `session.clear()`.
+**Fix:**
+- Change the existing response in place rather than returning a new one: set `status = 503`, replace the body and content type, and drop any `Set-Cookie`. The app's middleware then still adds its headers.
+- Offer an `on_store_error(request, exc)` hook, so the app can render its own JSON body.
+- Fall back to returning a new response only for streaming responses, where the body can't be replaced.
 
-**Fix.** Pass the same attributes the cookie was set with: `path="/", domain=self.domain, secure=self.secure, samesite=...`. This also matters for `__Host-` cookies, which must be deleted with `Secure; Path=/` and no `Domain`.
+#### M-2. A value that isn't JSON-serializable loses the whole save, silently, and skips the app's headers **[verified]**
 
-#### M-4. Tests, CI and release workflow are stale
-- **Tests:** 21 fail, as summarised in section 2.
-- **CI:** it has never run on the fork, and targets Python 3.7–3.11 with `@v2` actions. `tox.ini:17-18` installs extras that don't exist (`.[memcached]`, `.[msgpack]`).
-- **Release:** `python-publish.yml` would upload to PyPI as `sanic-session`, the upstream project's name, on any GitHub release.
+`base.py:239`. `json.dumps(dict(session))` raises `TypeError` for a `set`, a `datetime`, `bytes` or a custom object. It is not a `SessionStoreError`, so:
+- Sanic logs it as a response-middleware exception;
+- the client receives the **original 200**, though nothing was saved;
+- the remaining response middleware are skipped (the test app's `X-App` header was missing).
 
-**Fix.**
-- Update the tests to `response.cookies.get_cookie(name)`, and to `pytest-asyncio`'s current API (`@pytest.mark.asyncio` with no `event_loop` fixture).
-- Add end-to-end tests that use `sanic-testing` with a real Sanic app, covering memcached via a service container in GitHub Actions.
-- Test on Python 3.12–3.14 with Sanic 25.
-- Enable Actions on the fork, and delete or disable the PyPI publish workflow unless the fork is published under its own name.
+**Fix:** catch `TypeError`/`ValueError` around the `dumps` and log it as an application error naming the offending key. Either raise during the request, or treat it like a store error (M-1). Document that session values must be JSON types, or accept `dumps`/`loads` parameters.
 
-#### M-5. The non-memcached backends depend on abandoned drivers
-- **`aioredis.py`:** aioredis was archived in 2021 and breaks on Python 3.11+ (H-3).
-- **`redis.py`:** `asyncio_redis`'s last release was 0.16.0, and it is unmaintained.
-- **`mongodb.py`:** `sanic_motor`/Motor are superseded by PyMongo's async API, and `mongodb.py:137` uses the deprecated `datetime.utcnow()`.
+#### M-3. Expiry doesn't slide: a session that is read but not written expires while in use **[verified]**
 
-modular-sanic uses none of these, but their import side effects can break it (H-3).
+Since saves happen only on change, the store TTL and the cookie's `Max-Age` are refreshed only when something is written.
 
-**Fix.** Drop them, or replace the two Redis backends with one on `redis.asyncio` (redis-py ≥4.2). Keep only memcached and in-memory if the fork is meant for modular-sanic.
+With `InMemorySessionInterface(expiry=2)`, a session read every 0.9 s was gone at 2.7 s. memcached behaves the same, because `get` doesn't extend `exptime`.
+
+modular-sanic hides this today: `verify()` rewrites `visit` once a minute. Any other app, or a modular-sanic endpoint that doesn't call `verify()`, gets absolute expiry while the docs imply idle expiry.
+
+**Fix:** add `refresh_interval` (for example `expiry // 10`):
+- store the last save time in the session (`_saved`);
+- in `save()`, also write (memcached: `touch`, which aiomcache supports, or a full write) and re-send the cookie when it is older than that.
+
+Document the choice either way.
+
+#### M-4. Every request with a session cookie reads the store, including static files **[measured]**
+
+`open()` is eager. In modular-sanic each `/index.html`, `/logon/logo.webp` or `/favicon.ico` with a cookie costs one memcached `get` (1.00 per request, measured), and so does every route that never looks at the session.
+
+A memcached `get` is fast (sub-millisecond on localhost), but it is pure overhead on asset-heavy pages, and it makes memcached a hard dependency of static files.
+
+**Fix (pick one):**
+- Add an `ignore` option (path prefixes or a predicate) that leaves those requests with a non-loading placeholder.
+- Make `SessionDict` lazy: `open()` stores only the id, and an `await request.ctx.session.load()` (or a load on first access, done by the open middleware when the route is marked) fetches the data.
+
+The first option is a small change and covers the static-file case.
 
 ### LOW
 
-| ID | Location | Issue | Fix |
+| ID | Where | Issue | Fix |
 |---|---|---|---|
-| L-1 | `base.py:55-57,70` | `Expires` is built with `datetime.fromtimestamp()` (local time, no time zone) and then sent labelled `GMT`. With `TZ=America/New_York`, the default in modular-sanic-docker, it was **4 hours early** **[verified]**. Browsers prefer `Max-Age`, but other clients may not. | `datetime.fromtimestamp(expires, tz=timezone.utc)`. |
-| L-2 | `__init__.py:45-46` | Middleware is added by pushing onto `app.request_middleware`/`app.response_middleware` directly. That bypasses Sanic's `register_middleware(..., priority=)` ordering and depends on internals. | `app.register_middleware(open_fn, "request", priority=1000)` and `app.register_middleware(save_fn, "response", priority=-1000)`. |
-| L-3 | `base.py:62-80`; interface defaults | `secure` defaults to `False`, `samesite` to unset (Sanic then uses Lax), and `add_cookie` is called with `secure=False` and then patched afterwards. | Default `secure=True` and `samesite="Lax"`, and pass the final values to `add_cookie` in one call. |
-| L-4 | whole session | Concurrent requests on one session overwrite each other, because the whole dict is saved and the last write wins. For example, two tabs changing different keys at once lose one of the changes. | Document it. Optionally save only changed keys, or support compare-and-swap (`cas`) with memcached. |
-| L-5 | `setup.py:36-66`, `README.md`, `docs/` | Metadata and docs still describe upstream: author, `url` (subyraman), Python 3.7–3.11 classifiers, Read the Docs links. The docs also promise the broken `expiry=0` behaviour (H-1). | Update to the fork, and correct the expiry docs. |
-| L-6 | `base.py:6`, `setup.py` | `ujson` is a required dependency just for JSON. | Use the standard `json` module, or let the caller pass `dumps`/`loads`, for example `orjson`. |
-| L-7 | `memcache.py:70`, `utils.py:96-101` | `warnings.warn` has no `stacklevel` (ruff B028). `ExpiringDict.get` treats falsy stored values as missing. | `stacklevel=2`; check `key in self` explicitly. |
+| L-1 | `base.py:155-174` | A transient **read** failure (timeout) gives a new empty session with a new id. If that request then changes the session (modular-sanic sets `motd` on `/auth/info`), the new id is saved and sent, and the user's real, still-stored session is replaced. That is a permanent logout from a momentary blip. | On read failure, keep the client's id and mark the session "unloaded" so `save()` skips it; only issue a new id when the id is invalid or truly absent. |
+| L-2 | `base.py:40-43`, README | Concurrent requests: the last write wins (documented). With H-1's fix the window is unchanged; it is still worth offering memcached `cas` for apps that keep counters or carts. | Optional `gets`/`cas` in `MemcacheSessionInterface`. |
+| L-3 | `base.py:182-202` | `regenerate()` deletes the old key immediately. If the later save fails (503), the user has neither the old nor the new session. Acceptable, but undocumented. | Document it, or delete the old key in `save()` after the new one is written. |
+| L-4 | `base.py:110`, `memcache.py:98`, `memory.py:39` | `_get_value(prefix, sid)` takes a `prefix` that every backend ignores in favour of `self.prefix`, while `_set_value`/`_delete_key` take the full key. The backend API is inconsistent. | `_get_value(key)` with the full key, like the others. |
+| L-5 | `__init__.py:31` | `Session(app)` without an interface silently uses the in-memory store (per worker, lost on restart). With several workers, logons appear to work, then don't. | Log a warning when the default is used and `app.state.workers > 1`. |
+| L-6 | health | The package is small, typed loosely and fully tested end-to-end; CI is green across 3.10–3.14. There is no coverage report, and no test for nested mutation (H-1), non-JSON values (M-2) or idle expiry (M-3). | Add those three tests with the fixes; optionally `pytest --cov` in CI. |
 
----
+## 4. Status of findings from the first review
 
-## 4. What modular-sanic needs from the fork
-
-These changes would let modular-sanic delete its workarounds and trust its session layer. They are listed in the order that unblocks the most.
-
-| # | Change in the fork | Then in modular-sanic |
+| Item | Status | Notes |
 |---|---|---|
-| 1 | **Packaging (H-3):** `setuptools>=61` build backend, import-safe optional backends, version `0.9.0` and a git tag | Pin `sanic_session@git+https://github.com/jskenney/sanic-session@v0.9.0`; drop `--no-build-isolation` from `start.sh` and from modular-sanic-docker's Dockerfile |
-| 2 | **Expiry semantics (H-1):** no `Max-Age=0` except on delete; memcached TTL capped at 30 days while the cookie keeps the requested age | Remove the `min(AUTH_VALID, 2592000)` cap (`server.py:42`) |
-| 3 | **Save only when modified (M-1)**, with no DELETE for sessions that were never stored | Remove the `SaveWhenModified` mixin and its two subclasses (`server.py:47-58`) |
-| 4 | **Public `regenerate()` (H-4)**, and new IDs for unknown ones | `_rotate_session` (`server.py:386-389`) calls `await interface.regenerate(request)` instead of private attributes |
-| 5 | **Safe input and backend errors (H-2):** validated session IDs, read errors treated as an empty session, write errors raised as `SessionStoreError` | Catch `SessionStoreError` in the logon endpoints and return 503 instead of a false success; malformed cookies stop causing 500s |
-| 6 | **Correct cookie deletion (M-3)** | Logoff reliably clears the cookie, including if `domain` is ever used |
-| 7 | **In-memory store purge and O(1) lookups (M-2)** | The memcached-down fallback stops leaking memory |
-| 8 | **UTC `Expires` (L-1)** | Correct cookie dates under modular-sanic-docker's `TZ` |
-| 9 | **Tests and CI (M-4)** for memcached and in-memory on Python 3.12–3.14 / Sanic 25 | modular-sanic's own tests (when added) can rely on the session layer's behaviour |
-| 10 | **Drop or replace the abandoned backends (M-5)** | Smaller install, and no import-time breakage |
-
----
+| H-1 permanent and over-30-day sessions deleted | **Fixed** | `expiry=0` gives a browser-session cookie; the TTL is capped at 30 days. |
+| H-2 backend and input errors give 500s or lost sessions | **Fixed** | Read errors give a new session; write errors give a 503. See the new M-1, M-2 and L-1. |
+| H-3 packaging | **Fixed** | `pyproject.toml`, `v0.9.0` tag; installed by modular-sanic from the tag. |
+| H-4 client-chosen ids, no regenerate | **Fixed** | Verified in modular-sanic (unknown id gives a new id; `regenerate` on logon). |
+| M-1 write on every response | **Fixed** | Verified: 0 sets for unchanged sessions. It introduced H-1 and M-3. |
+| M-2 in-memory store purge and lookups | **Fixed** | |
+| M-3 cookie delete flags | **Fixed** | |
+| M-4 tests, CI, release | **Fixed** | 46 tests, green CI. |
+| M-5 abandoned drivers | **Fixed** | Redis and MongoDB removed. |
+| L-1 to L-7 | **Fixed** | The L-4 concurrency note is now in the README; still listed above as L-2. |
 
 ## 5. Prioritized top 10
 
-1. **H-3.** Fix the build backend and the import-time crash, then version and tag the fork so modular-sanic can pin it.
-2. **H-1.** Correct the expiry handling (no `Max-Age=0`, a proper 30-day memcached cap, working "permanent" sessions).
-3. **H-2.** Validate session IDs and handle backend errors: no 500s for bad cookies or corrupt data, and no silently lost logons when memcached is down.
-4. **H-4.** Reject unknown session IDs, and add a public `regenerate()` for modular-sanic's ID rotation.
-5. **M-1.** Save only modified sessions, and stop sending memcached DELETEs for every cookie-less request.
-6. **M-4.** Repair the tests, add end-to-end memcached tests, and enable CI on Python 3.12–3.14; disable the PyPI publish workflow.
-7. **M-3.** Delete cookies with the same domain, path and flags they were set with.
-8. **M-2.** Make the in-memory store purge expired sessions and stop copying itself on every lookup.
-9. **M-5.** Drop or modernise the Redis and MongoDB backends.
-10. **L-1 to L-3.** UTC `Expires`, middleware registered through Sanic's public API with priorities, and secure cookie defaults.
+1. **H-1:** detect nested changes, by comparing against the loaded JSON, and add tests.
+2. **M-1:** keep the app's headers on the store-error 503, by changing the response in place, and add an error hook.
+3. **M-2:** handle values that aren't JSON-serializable explicitly, never as a silent 200.
+4. **M-3:** add sliding expiry (`refresh_interval` or `touch`), or document absolute expiry.
+5. **L-1:** don't replace a client's session id because of a transient read error.
+6. **M-4:** add an `ignore` option for static paths, to skip the store read.
+7. **L-6:** add tests for H-1, M-2 and M-3; add coverage in CI.
+8. **L-5:** warn when the in-memory default is used with several workers.
+9. **L-3:** document, or reorder, the regenerate delete.
+10. **L-4 and L-2:** make the backend API consistent; optional `cas`.
