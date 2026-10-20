@@ -1,57 +1,55 @@
-# Sanic session management for humans
-[![ReadTheDocs](https://img.shields.io/readthedocs/sanic_session.svg)](https://sanic-session.readthedocs.io)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
-[![PyPI version](https://img.shields.io/pypi/v/sanic_session.svg)](https://pypi.org/project/sanic_session/)
+# sanic-session (jskenney fork)
 
+Server-backed sessions for [Sanic](https://sanic.dev), stored in memcached or in the server process. This fork of [ahopkins/sanic-session](https://github.com/ahopkins/sanic-session) is maintained for [Modular Sanic](https://github.com/jskenney/modular-sanic). It supports only the memcached and in-memory backends; the Redis and MongoDB backends were removed.
 
-`sanic-session` is session management extension for [Sanic](https://sanic.dev) that integrates server-backed sessions with most convenient API.
-
-`sanic-session` provides a number of *session interfaces* for you to store a client's session data. The interfaces available right now are:
-
-  * Redis (supports both drivers `aioredis` and `asyncio_redis`)
-  * Memcache (via `aiomcache`)
-  * Mongodb (via `sanic_motor` and `pymongo`)
-  * In-Memory (suitable for testing and development environments)
+Requires Python 3.10+ and Sanic 23.3+.
 
 ## Installation
 
-Install with `pip` (there is other options for different drivers, check documentation):
+```bash
+pip install "sanic-session[aiomcache] @ git+https://github.com/jskenney/sanic-session@v0.9.0"
+```
 
-`pip install sanic_session`
-
-
-## Documentation
-
-Documentation is available at [sanic-session.readthedocs.io](http://sanic-session.readthedocs.io/en/latest/).
-
-Also, make sure you read [OWASP's Session Management Cheat Sheet](https://www.owasp.org/index.php/Session_Management_Cheat_Sheet) for some really useful info on session management.
+The `aiomcache` extra installs the memcached driver; leave it out if you only use the in-memory backend. Pin a tag (as above) so installs are reproducible.
 
 ## Example
 
-A simple example uses the in-memory session interface.
-
 ```python
+import aiomcache
 from sanic import Sanic
 from sanic.response import text
-from sanic_session import Session, InMemorySessionInterface
+from sanic_session import Session, MemcacheSessionInterface
 
 app = Sanic(name="ExampleApp")
-session = Session(app, interface=InMemorySessionInterface())
+Session(app, interface=MemcacheSessionInterface(aiomcache.Client("127.0.0.1", 11211)))
 
 @app.route("/")
 async def index(request):
     # interact with the session like a normal dict
-    if not request.ctx.session.get('foo'):
-        request.ctx.session['foo'] = 0
-
-    request.ctx.session['foo'] += 1
-
+    request.ctx.session["foo"] = request.ctx.session.get("foo", 0) + 1
     return text(str(request.ctx.session["foo"]))
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
 ```
 
-Examples of using redis and memcache backed sessions can be found in the documentation, under [Using the Interfaces](http://sanic-session.readthedocs.io/en/latest/using_the_interfaces.html).
+For development and tests, use `InMemorySessionInterface()` instead. It is not shared between workers and is lost on restart.
 
-<p align="center">&mdash; ⭐️ &mdash;</p>
+## How it behaves
+
+- **Cookies** are `HttpOnly`, `Secure` and `SameSite=Lax` by default, always with `Path=/`, so a `__Host-` cookie name works. `Secure` cookies are only sent over HTTPS, or to `http://localhost`. Pass `secure=False` for plain-HTTP development on other hosts.
+- **Expiry:** `expiry` (default 30 days) sets the cookie's `Max-Age` and a UTC `Expires`. `expiry=0` (or `None`) means no expiry: the cookie lasts until the browser closes, and the store keeps the session indefinitely. memcached keeps entries at most 30 days, so with a longer `expiry` a session unused for 30 days expires in the store.
+- **Saving:** a session is stored, and its cookie sent, only when it changed during the request. Clearing it (`request.ctx.session.clear()`) deletes it from the store and removes the cookie. Requests that never touch the session cause no store traffic.
+- **Session ids** are random. A cookie that isn't a valid id, or names a session that isn't stored, gets a new id, so clients can't choose their own. Call `await interface.regenerate(request)` on logon, or when privileges change, to move the session to a new id.
+- **Store errors:** if the store can't be read (memcached down, corrupt data), the request continues with a new, empty session and a warning is logged. If it can't be written, the response is replaced with a **503**, so a client never believes a change (such as a logon) was kept when it wasn't.
+- **Middleware order:** the session is opened before your request middleware (so they can use it), and saved before your response middleware run.
+- **Concurrency:** each request saves the whole session, so when two requests for the same session overlap, the last one to finish wins. Changes the other made to different keys are lost.
+
+See [docs/source/configuration.rst](docs/source/configuration.rst) for every option.
+
+## Development
+
+```bash
+pip install -e .[dev]
+ruff check sanic_session tests example
+pytest            # the memcached tests need memcached on 127.0.0.1:11211
+```
+
+Also make sure to read [OWASP's Session Management Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).

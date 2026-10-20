@@ -1,8 +1,3 @@
-.. sanic_session documentation master file, created by
-   sphinx-quickstart on Tue Jan 10 00:43:29 2017.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
 sanic_session
 =========================================
 
@@ -15,49 +10,30 @@ sanic_session
    configuration
    testing
 
-sanic_session is an extension for sanic that integrates server-backed sessions with a Flask-like API. 
+sanic_session is an extension for Sanic that integrates server-backed sessions with a dict-like API.
 
-Install it with pip: :code:`pip install sanic_session`
+Install it with pip: :code:`pip install "sanic-session[aiomcache] @ git+https://github.com/jskenney/sanic-session@v0.9.0"`
 
-sanic_session provides a number of *session interfaces* for you to store a client's session data. The interfaces available right now are:
+Sessions can be stored in:
 
-* Redis
-* Memcache
-* In-Memory (suitable for testing and development environments)
+* memcached (:code:`MemcacheSessionInterface`, through :code:`aiomcache`)
+* the server process (:code:`InMemorySessionInterface`, for testing and development)
 
 See :ref:`using_the_interfaces` for instructions on using each.
 
-A simple example uses the in-memory session interface.
+A simple example uses the in-memory session interface:
 
 .. code-block:: python
 
     from sanic import Sanic
     from sanic.response import text
-    from sanic_session import Session
+    from sanic_session import Session, InMemorySessionInterface
 
-    app = Sanic()
-    Session(app)
+    app = Sanic("ExampleApp")
+    Session(app, interface=InMemorySessionInterface())
 
     @app.route("/")
     async def index(request):
         # interact with the session like a normal dict
-        if not request.ctx.session.get('foo'):
-            request.ctx.session['foo'] = 0
-
-        request.ctx.session['foo'] += 1
-
-        return text(request.ctx.session['foo'])
-
-    if __name__ == "__main__":
-        app.run(host="0.0.0.0", port=8000, debug=True)
-
-
-
-==================
-
-* :ref:`using_the_interfaces`
-* :ref:`api`
-* :ref:`configuration`
-* :ref:`testing`
-
-
+        request.ctx.session["foo"] = request.ctx.session.get("foo", 0) + 1
+        return text(str(request.ctx.session["foo"]))

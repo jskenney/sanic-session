@@ -1,14 +1,56 @@
 [build-system]
-requires = ["setuptools<60.0", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.black]
-line-length = 79
-target-version = ['py37','py38', 'py39', 'py310', 'py311']
+[project]
+name = "sanic-session"
+version = "0.9.0"
+description = "Server-backed sessions for Sanic, stored in memcached or in memory."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE", "FLASK_LICENSE"]
+authors = [
+    { name = "Suby Raman" },
+    { name = "Mikhail Kashkin" },
+    { name = "Adam Hopkins" },
+    { name = "J. Kenney" },
+]
+requires-python = ">=3.10"
+dependencies = ["sanic>=23.3"]
+keywords = ["sessions", "sanic", "memcache"]
+classifiers = [
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: Session",
+]
 
-[tool.isort]
-profile = "black"
-src_paths = ["sanic_session", "tests"]
-line_length = 79
-multi_line_output = 3
-include_trailing_comma = true
+[project.optional-dependencies]
+aiomcache = ["aiomcache>=0.8"]
+dev = [
+    "aiomcache>=0.8",
+    "pytest",
+    "pytest-asyncio",
+    "sanic-testing",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/jskenney/sanic-session"
+Upstream = "https://github.com/ahopkins/sanic-session"
+
+[tool.setuptools]
+packages = ["sanic_session"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]

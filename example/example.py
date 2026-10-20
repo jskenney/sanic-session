@@ -1,6 +1,7 @@
 from sanic import Sanic
 from sanic.response import text
-from sanic_session import Session, InMemorySessionInterface
+
+from sanic_session import InMemorySessionInterface, Session
 
 app = Sanic(name="ExampleApp")
 session = Session(app, interface=InMemorySessionInterface())
@@ -18,4 +19,6 @@ async def index(request):
 
 
 if __name__ == "__main__":
+    # The session cookie is Secure by default: browsers accept it on
+    # http://localhost, use HTTPS anywhere else.
     app.run(port=9999, dev=True)
