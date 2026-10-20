@@ -1,17 +1,24 @@
-from .aioredis import AIORedisSessionInterface
+from sanic.log import logger
+from sanic.response import text
+
+from .base import SessionDict, SessionStoreError
 from .memcache import MemcacheSessionInterface
 from .memory import InMemorySessionInterface
-from .mongodb import MongoDBSessionInterface
-from .redis import RedisSessionInterface
 
 __all__ = (
     "MemcacheSessionInterface",
-    "RedisSessionInterface",
     "InMemorySessionInterface",
-    "MongoDBSessionInterface",
-    "AIORedisSessionInterface",
     "Session",
+    "SessionDict",
+    "SessionStoreError",
 )
+
+__version__ = "0.9.0"
+
+# The session is opened before the application's own request middleware (so
+# they can use it) and saved before its response middleware run.
+REQUEST_PRIORITY = 1000
+RESPONSE_PRIORITY = -1000
 
 
 class Session:
@@ -29,18 +36,27 @@ class Session:
             self.interface.session_name
         ] = self  # session_name defaults to 'session'
 
-        # @app.middleware('request')
         async def add_session_to_request(request):
             """Before each request initialize a session
             using the client's request."""
             await self.interface.open(request)
 
-        # @app.middleware('response')
         async def save_session(request, response):
             """After each request save the session, pass
-            the response to set client cookies.
+            the response to set client cookies.  When the store cannot be
+            written, the response is replaced with a 503 so the client does
+            not believe a change (e.g. a logon) was kept.
             """
-            await self.interface.save(request, response)
+            try:
+                await self.interface.save(request, response)
+            except SessionStoreError as e:
+                logger.error(f"Session store write failed: {e}")
+                return text(
+                    "The session store is unavailable, please try again later.",
+                    status=503,
+                )
 
-        app.request_middleware.appendleft(add_session_to_request)
-        app.response_middleware.append(save_session)
+        app.register_middleware(
+            add_session_to_request, "request", priority=REQUEST_PRIORITY
+        )
+        app.register_middleware(save_session, "response", priority=RESPONSE_PRIORITY)

@@ -3,27 +3,25 @@
 API Documentation
 =====================
 
+Session
+------------------------------------------------
+
+.. autoclass:: sanic_session.Session
+    :members:
+
 InMemorySessionInterface
 ------------------------------------------------
 
 .. autoclass:: sanic_session.InMemorySessionInterface
-    :members:
+    :members: open, save, regenerate
 
 MemcacheSessionInterface
 -----------------------------------------------
 
 .. autoclass:: sanic_session.MemcacheSessionInterface
-    :members:
+    :members: open, save, regenerate
 
-RedisSessionInterface
+SessionStoreError
 -----------------------------------------------
 
-.. autoclass:: sanic_session.RedisSessionInterface
-    :members:
-
-
-AIORedisSessionInterface
------------------------------------------------
-
-.. autoclass:: sanic_session.AIORedisSessionInterface
-    :members:
+.. autoclass:: sanic_session.SessionStoreError

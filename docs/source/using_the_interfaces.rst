@@ -3,133 +3,14 @@
 Using the interfaces
 =====================
 
-For now project has set of different interfaces. You can install each manually or using the extra parameters:
+Install the memcached driver with the ``aiomcache`` extra::
 
-:code:`pip install sanic_session[aioredis]`
-
-Other supported backend keywords:
-
-- :code:`aioredis` (dependency 'aioredis'),
-- :code:`redis` ('asyncio_redis'),
-- :code:`mongo` ('sanic_motor' and 'pymongo'),
-- :code:`aiomcache` ('aiomcache')
-
-
-Redis (asyncio_redis)
------------------
-`Redis <https://redis.io/>`_ is a popular and widely supported key-value store. In order to interface with redis, you will need to add :code:`asyncio_redis` to your project. Do so with pip:
-
-:code:`pip install asyncio_redis` or :code:`pip install sanic_session[redis]`
-
-To integrate Redis with :code:`sanic_session` you need to pass a getter method into the :code:`RedisSessionInterface` which returns a connection pool. This is required since there is no way to synchronously create a connection pool. An example is below:
-
-.. code-block:: python
-
-    import asyncio_redis
-
-    from sanic import Sanic
-    from sanic.response import text
-    from sanic_session import Session, RedisSessionInterface
-
-    app = Sanic("Test")
-
-
-    class Redis:
-        """
-        A simple wrapper class that allows you to share a connection
-        pool across your application.
-        """
-
-        _pool = None
-
-        async def get_redis_pool(self):
-            if not self._pool:
-                self._pool = await asyncio_redis.Pool.create(
-                    host="localhost", port=6379, poolsize=10
-                )
-
-            return self._pool
-
-
-    redis = Redis()
-
-    Session(app, interface=RedisSessionInterface(redis.get_redis_pool))
-
-
-    @app.route("/")
-    async def test(request):
-        # interact with the session like a normal dict
-        if not request.ctx.session.get("foo"):
-            request.ctx.session["foo"] = 0
-
-        request.ctx.session["foo"] += 1
-
-        response = text(str(request.ctx.session["foo"]))
-
-        return response
-
-    if __name__ == "__main__":
-        app.run(host="0.0.0.0", port=8000, debug=True)
-
-
-Redis (aioredis)
------------------
-`aioredis` have little better syntax and more popular since it supported by `aiohttp` team.
-
-:code:`pip install asyncio_redis` or :code:`pip install sanic_session[aioredis]`
-
-This example shows little different approach. You can use classic Flask extensions approach with factory based initialization process. You can use it with different backends also.
-
-.. code-block:: python
-
-    import aioredis
-
-    from sanic import Sanic
-    from sanic.response import text
-    from sanic_session import Session, AIORedisSessionInterface
-
-    app = Sanic("Test")
-    # init extensions
-    session = Session(app=app)
-    app.config.REDIS_DSN = "redis://localhost:6379/0"
-
-
-    @app.listener("before_server_start")
-    async def server_init(app, loop):
-        # For aioredis 1.x and older
-        # app.redis = await aioredis.create_redis_pool(app.config['redis'])
-        # For aioredis 2.x
-        app.ctx.redis = aioredis.from_url(
-            app.config.REDIS_DSN, decode_responses=True
-        )
-        # init extensions fabrics
-        session.init_app(app, interface=AIORedisSessionInterface(app.ctx.redis))
-
-
-    @app.route("/")
-    async def test(request):
-        # interact with the session like a normal dict
-        if not request.ctx.session.get("foo"):
-            request.ctx.session["foo"] = 0
-
-        request.ctx.session["foo"] += 1
-
-        response = text(str(request.ctx.session["foo"]))
-
-        return response
-
-    if __name__ == "__main__":
-        app.run(host="0.0.0.0", port=8000, debug=True)
-
+    pip install "sanic-session[aiomcache] @ git+https://github.com/jskenney/sanic-session@v0.9.0"
 
 Memcache
 -----------------
-`Memcache <https://memcached.org/>`_ is another popular key-value storage system. In order to interface with memcache, you will need to add :code:`aiomcache` to your project. Do so with pip:
 
-:code:`pip install aiomcache` or :code:`pip install sanic_session[aiomcache]`
-
-To integrate memcache with :code:`sanic_session` you need to pass an :code:`aiomcache.Client` into the session interface, as follows:
-
+Pass an :code:`aiomcache.Client` into the session interface:
 
 .. code-block:: python
 
@@ -139,60 +20,54 @@ To integrate memcache with :code:`sanic_session` you need to pass an :code:`aiom
     from sanic.response import text
     from sanic_session import Session, MemcacheSessionInterface
 
-    app = Sanic("Test")
-
-    # create a memcache client
+    app = Sanic("MemcacheApp")
     client = aiomcache.Client("127.0.0.1", 11211)
-
-    # pass the memcache client into the session
-    session = Session(app, interface=MemcacheSessionInterface(client))
+    Session(app, interface=MemcacheSessionInterface(client))
 
 
     @app.route("/")
-    async def test(request):
-        # interact with the session like a normal dict
-        if not request.ctx.session.get("foo"):
-            request.ctx.session["foo"] = 0
-
-        request.ctx.session["foo"] += 1
-
-        response = text(str(request.ctx.session["foo"]))
-
-        return response
-
-    if __name__ == "__main__":
-        app.run(host="0.0.0.0", port=8000, debug=True, loop=loop)
+    async def index(request):
+        request.ctx.session["foo"] = request.ctx.session.get("foo", 0) + 1
+        return text(str(request.ctx.session["foo"]))
 
 In-Memory
 -----------------
 
-:code:`sanic_session` comes with an in-memory interface which stores sessions in a Python dictionary available at :code:`session_interface.session_store`. This interface is meant for testing and development purposes only. **This interface is not suitable for production**.
+:code:`InMemorySessionInterface` keeps sessions in the server process: they are not shared between workers and are lost on restart, so use it for testing and development. Expired sessions are removed automatically.
 
 .. code-block:: python
 
     from sanic import Sanic
     from sanic.response import text
-    from sanic_session import Session
+    from sanic_session import Session, InMemorySessionInterface
 
+    app = Sanic("InMemoryApp")
+    Session(app, interface=InMemorySessionInterface())
 
-    app = Sanic("Test")
+Factory initialization
+----------------------
 
-    Session(app)  # because InMemorySessionInterface used by default
+The session can also be attached to an app later:
 
-    # of full syntax:
-    #   from sanic_session import InMemorySessionInterface
-    #   session = Session(app, interface=InMemorySessionInterface())
+.. code-block:: python
 
+    session = Session()
 
-    @app.route("/")
-    async def index(request):
-        # interact with the session like a normal dict
-        if not request.ctx.session.get("foo"):
-            request.ctx.session["foo"] = 0
+    def create_app():
+        app = Sanic("FactoryApp")
+        session.init_app(app, interface=InMemorySessionInterface())
+        return app
 
-        request.ctx.session["foo"] += 1
+Changing the session id
+-----------------------
 
-        return text(str(request.ctx.session["foo"]))
+When a user logs on, move their session to a new id so an id seen before logon stops working:
 
-    if __name__ == "__main__":
-        app.run(host="0.0.0.0", port=8000, debug=True)
+.. code-block:: python
+
+    @app.post("/login")
+    async def login(request):
+        ...  # check the credentials
+        await request.app.ctx.extensions["session"].interface.regenerate(request)
+        request.ctx.session["user"] = username
+        return text("ok")

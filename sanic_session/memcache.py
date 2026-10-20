@@ -4,8 +4,11 @@ from sanic_session.base import BaseSessionInterface
 
 try:
     import aiomcache
-except ImportError:  # pragma: no cover
+except Exception:  # pragma: no cover
     aiomcache = None
+
+# memcached treats an expiry over 30 days as a timestamp, so it is the limit
+MEMCACHE_MAX_TTL = 2592000
 
 
 class MemcacheSessionInterface(BaseSessionInterface):
@@ -18,20 +21,24 @@ class MemcacheSessionInterface(BaseSessionInterface):
         cookie_name: str = "session",
         prefix: str = "session:",
         sessioncookie: bool = False,
-        samesite: str = None,
+        samesite: str = "Lax",
         session_name: str = "session",
-        secure: bool = False,
+        secure: bool = True,
     ):
         """Initializes the interface for storing client sessions in memcache.
-        Requires a client object establised with `asyncio_memcache`.
+        Requires a client object established with `aiomcache`.
 
         Args:
-            memcache_connection (aiomccache.Client):
+            memcache_connection (aiomcache.Client):
                 The memcache client used for interfacing with memcache.
             domain (str, optional):
                 Optional domain which will be attached to the cookie.
             expiry (int, optional):
-                Seconds until the session should expire.
+                Seconds until the session should expire (0 or None: no
+                expiry, the cookie lasts until the browser closes).
+                memcached keeps an entry at most 30 days: longer values keep
+                the full cookie lifetime but expire unused sessions in the
+                store after 30 days.
             httponly (bool, optional):
                 Adds the `httponly` flag to the session cookie.
             cookie_name (str, optional):
@@ -44,10 +51,8 @@ class MemcacheSessionInterface(BaseSessionInterface):
                 no Expires or Max-age headers are included. Expiry is still
                 fully tracked on the server side. Default setting is False.
             samesite (str, optional):
-                Will prevent the cookie from being sent by the browser to
-                the target site in all cross-site browsing context, even when
-                following a regular link. One of ('lax', 'strict')
-                Default: None
+                The cookie's SameSite setting: 'Lax' (default), 'Strict',
+                'None', or None to leave it out.
             session_name (str, optional):
                 Name of the session that will be accessible through the
                 request.
@@ -57,7 +62,7 @@ class MemcacheSessionInterface(BaseSessionInterface):
                 accessed like that: ``request.ctx.session``
                 Default: 'session'
             secure (bool, optional):
-                Adds the `Secure` flag to the session cookie.
+                Adds the `Secure` flag to the session cookie (default True).
         """
         if aiomcache is None:
             raise RuntimeError(
@@ -67,9 +72,13 @@ class MemcacheSessionInterface(BaseSessionInterface):
 
         self.memcache_connection = memcache_connection
 
-        if expiry > 2592000:
-            warnings.warn("Memcache has a maximum 30-day cache limit")
-            expiry = 0
+        if expiry and expiry > MEMCACHE_MAX_TTL:
+            warnings.warn(
+                "memcached keeps entries at most 30 days: sessions unused "
+                "for longer expire in the store, the cookie keeps the full "
+                "expiry",
+                stacklevel=2,
+            )
 
         super().__init__(
             expiry=expiry,
@@ -83,6 +92,9 @@ class MemcacheSessionInterface(BaseSessionInterface):
             secure=secure,
         )
 
+    def _store_ttl(self):
+        return min(self.expiry, MEMCACHE_MAX_TTL) if self.expiry else 0
+
     async def _get_value(self, prefix, sid):
         key = (self.prefix + sid).encode()
         value = await self.memcache_connection.get(key)
@@ -93,5 +105,5 @@ class MemcacheSessionInterface(BaseSessionInterface):
 
     async def _set_value(self, key, data):
         return await self.memcache_connection.set(
-            key.encode(), data.encode(), exptime=self.expiry
+            key.encode(), data.encode(), exptime=self._store_ttl()
         )
