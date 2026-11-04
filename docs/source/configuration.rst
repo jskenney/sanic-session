@@ -34,7 +34,7 @@ When initializing a session interface, you have a number of optional arguments f
 **secure** (bool, optional):
     Adds the ``Secure`` flag, so browsers only send the cookie over HTTPS (``http://localhost`` also counts as secure). Defaults to True; set False only for plain-HTTP development on another host.
 **refresh_interval** (float, optional):
-    Seconds after which an unchanged session is written again, renewing its store expiry and its cookie, so a session in use does not expire. Defaults to a tenth of ``expiry``; ``0`` turns it off (the session then expires ``expiry`` seconds after it last changed).
+    Seconds after which an unchanged session is written again, renewing its store expiry and its cookie, so a session in use does not expire. Defaults to a tenth of ``expiry``; ``0`` turns it off (the session then expires ``expiry`` seconds after it last changed). A refresh only writes if the stored session is unchanged since the request read it, so it never overwrites another request's change.
 **cas** (bool, optional, ``MemcacheSessionInterface`` only):
     Save with memcached check-and-set. When another request saved the session after this one read it, the change is not written and the response is ``409 Conflict``. Defaults to False (the last save wins).
 

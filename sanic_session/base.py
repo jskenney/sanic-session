@@ -71,6 +71,8 @@ class SessionDict(CallbackDict):
             self._loaded_json = None
         self._saved_at = 0
         self._token = None
+        # The stored value as read, so a refresh never overwrites a newer one
+        self._raw = None
         # A stored id replaced by regenerate(), removed once the new id is saved
         self._old_sid = None
 
@@ -182,6 +184,21 @@ class BaseSessionInterface(metaclass=abc.ABCMeta):
         await self._set_value(key, data)
         return True
 
+    async def _refresh(self, key, data, raw, token):
+        """Write the value only if the store still holds ``raw`` (what this
+        request read); returns False, writing nothing, when it changed.
+
+        Used for refreshes, which rewrite a session the request did not
+        change: they must never overwrite a change another request saved
+        meanwhile.  This version suits stores whose ``_get_value`` and
+        ``_set_value`` do not wait (the in-memory store); backends with real
+        I/O override it with an atomic compare-and-set.
+        """
+        if await self._get_value(key) != raw:
+            return False
+        await self._set_value(key, data)
+        return True
+
     async def open(self, request) -> SessionDict:
         """
         Opens a session onto the request. Restores the client's session
@@ -231,6 +248,7 @@ class BaseSessionInterface(metaclass=abc.ABCMeta):
                     if isinstance(saved_at, (int, float)):
                         session_dict._saved_at = saved_at
                     session_dict._token = token
+                    session_dict._raw = val
 
         if session_dict is None:
             session_dict = SessionDict(sid=self._new_sid())
@@ -256,6 +274,7 @@ class BaseSessionInterface(metaclass=abc.ABCMeta):
         session.stored = False
         session.loaded = True
         session._token = None
+        session._raw = None
         session.modified = True
         return session
 
@@ -356,16 +375,29 @@ class BaseSessionInterface(metaclass=abc.ABCMeta):
             return
 
         stored_val = _dumps({**session, SAVED_AT_KEY: round(now, 3)})
-        token = session._token if session.stored else None
-        try:
-            written = await self._store(key, stored_val, token)
-        except Exception as e:
-            raise SessionStoreError(f"{type(e).__name__}: {e}") from e
-        if written is False:
-            raise SessionConflictError("the session was changed by another request")
+        if not changed:
+            # A refresh: only extend the session if no other request saved it
+            # since this one read it (that save refreshed it anyway)
+            try:
+                written = await self._refresh(
+                    key, stored_val, session._raw, session._token
+                )
+            except Exception as e:
+                raise SessionStoreError(f"{type(e).__name__}: {e}") from e
+            if not written:
+                return
+        else:
+            token = session._token if session.stored else None
+            try:
+                written = await self._store(key, stored_val, token)
+            except Exception as e:
+                raise SessionStoreError(f"{type(e).__name__}: {e}") from e
+            if written is False:
+                raise SessionConflictError("the session was changed by another request")
         session.stored = True
         session.modified = False
         session._loaded_json = val
+        session._raw = stored_val
         session._saved_at = round(now, 3)
         await self._delete_old_sid(session)
         self._set_cookie_props(request, response)

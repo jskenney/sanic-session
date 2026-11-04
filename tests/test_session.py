@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import time
@@ -551,3 +552,96 @@ async def test_in_memory_warns_with_several_workers(caplog):
     app = Sanic(f"listeners_{time.time_ns()}")
     Session(app)
     assert _warn_in_memory_workers in app.listeners["main_process_start"]
+
+
+# ---- refreshes never overwrite, failing store-error hooks
+
+
+def add_slow_read(app):
+    @app.get("/slowread")
+    async def slow_read(request):
+        n = request.ctx.session.get("n")  # reads only
+        await asyncio.sleep(0.3)
+        return response.json({"n": n})
+
+    return app
+
+
+async def test_refresh_does_not_overwrite_a_concurrent_change(backend):
+    interface = make_interface(backend, refresh_interval=0.01)
+    app = add_slow_read(make_app(interface))
+    sid = sid_of(await get(app, "/set"))
+    await asyncio.sleep(0.05)  # the session is due a refresh
+
+    async def change():
+        await asyncio.sleep(0.1)  # while the slow read is running
+        return await get(app, "/set", sid)
+
+    reader, writer = await asyncio.gather(get(app, "/slowread", sid), change())
+    assert reader.status == 200 and writer.status == 200
+    assert (await get(app, "/get", sid)).json == {"n": 2}
+
+
+@memcached_only
+async def test_refresh_with_cas_never_gives_a_read_a_conflict():
+    interface = make_interface("memcache", refresh_interval=0.01, cas=True)
+    app = add_slow_read(make_app(interface))
+    sid = sid_of(await get(app, "/set"))
+    await asyncio.sleep(0.05)
+
+    async def change():
+        await asyncio.sleep(0.1)
+        return await get(app, "/set", sid)
+
+    reader, writer = await asyncio.gather(get(app, "/slowread", sid), change())
+    assert reader.status == 200 and writer.status == 200
+    assert (await get(app, "/get", sid)).json == {"n": 2}
+
+
+async def test_refresh_still_renews_an_unchanged_session(backend):
+    interface = make_interface(backend, refresh_interval=0.01)
+    app = make_app(interface)
+    sid = sid_of(await get(app, "/set"))
+    key = interface.prefix + sid
+    before = json.loads(await interface._get_value(key))[SAVED_AT_KEY]
+    await asyncio.sleep(0.05)
+    res = await get(app, "/get", sid)
+    assert res.json == {"n": 1} and sid_of(res) == sid
+    after = json.loads(await interface._get_value(key))[SAVED_AT_KEY]
+    assert after > before
+
+
+def hook_app(hook):
+    interface = InMemorySessionInterface()
+    app = Sanic(f"hookfail_{time.time_ns()}")
+    Session(app, interface=interface, on_store_error=hook)
+
+    @app.get("/set")
+    async def set_(request):
+        request.ctx.session["n"] = 1
+        return response.text("x")
+
+    async def broken(*args):
+        raise ConnectionRefusedError("store down")
+
+    interface._set_value = broken
+    return app
+
+
+async def test_store_error_hook_that_raises_falls_back_to_default(caplog):
+    def hook(request, exc):
+        raise RuntimeError("hook bug")
+
+    res = await get(hook_app(hook), "/set")
+    assert res.status == 503 and "unavailable" in res.text
+    assert not set_cookie(res)
+    assert "hook bug" in caplog.text
+
+
+async def test_store_error_hook_returning_a_non_response_falls_back(caplog):
+    async def hook(request, exc):
+        return {"error": exc.message}
+
+    res = await get(hook_app(hook), "/set")
+    assert res.status == 503 and "unavailable" in res.text
+    assert "not a response" in caplog.text

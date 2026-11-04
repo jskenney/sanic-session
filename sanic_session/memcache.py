@@ -121,10 +121,16 @@ class MemcacheSessionInterface(BaseSessionInterface):
         )
 
     async def _load(self, key):
-        if not self.cas:
-            return await super()._load(key)
+        # The cas token is kept even without cas=True: refreshes use it
         value, token = await self.memcache_connection.gets(key.encode())
         return (value.decode() if value else None), token
+
+    async def _refresh(self, key, data, raw, token):
+        if token is None:
+            return False
+        return await self.memcache_connection.cas(
+            key.encode(), data.encode(), token, exptime=self._store_ttl()
+        )
 
     async def _store(self, key, data, token):
         if not self.cas or token is None:
