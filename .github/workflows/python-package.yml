@@ -31,4 +31,4 @@ jobs:
       - name: Lint
         run: ruff check sanic_session tests example
       - name: Test
-        run: pytest -v tests
+        run: pytest -v --cov=sanic_session --cov-report=term-missing tests

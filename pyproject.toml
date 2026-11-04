@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sanic-session"
-version = "0.9.0"
+version = "0.10.0"
 description = "Server-backed sessions for Sanic, stored in memcached or in memory."
 readme = "README.md"
 license = "MIT"
@@ -35,6 +35,7 @@ dev = [
     "aiomcache>=0.8",
     "pytest",
     "pytest-asyncio",
+    "pytest-cov",
     "sanic-testing",
     "ruff",
 ]

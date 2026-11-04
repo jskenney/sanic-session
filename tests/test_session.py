@@ -1,14 +1,17 @@
+import json
 import re
 import time
 import warnings
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from types import SimpleNamespace
 
 import pytest
 from sanic import Sanic, response
 
-from sanic_session import InMemorySessionInterface, Session
-from sanic_session.base import SID_PATTERN
+from sanic_session import InMemorySessionInterface, Session, SessionStoreError
+from sanic_session import _warn_in_memory_workers
+from sanic_session.base import SAVED_AT_KEY, SID_PATTERN
 
 from .conftest import MEMCACHED, make_app, make_interface
 
@@ -128,7 +131,7 @@ async def test_clear_deletes_session_and_cookie(backend):
     assert "Max-Age=0" in header
     assert "Domain=example.test" in header
     assert "Secure" in header
-    assert await interface._get_value(interface.prefix, sid) is None
+    assert await interface._get_value(interface.prefix + sid) is None
 
 
 async def test_delete_cookie_follows_secure_setting(backend):
@@ -290,3 +293,261 @@ async def test_in_memory_store_expires_entries():
     sid = sid_of(await get(app, "/set"))
     time.sleep(1.2)
     assert (await get(app, "/get", sid)).json == {}
+
+
+# ---- in-place changes, serialization, refresh, store errors, ignore
+
+
+def add_routes(app, interface):
+    @app.get("/cart")
+    async def cart(request):
+        request.ctx.session.setdefault("cart", []).append(1)
+        return response.json(request.ctx.session["cart"])
+
+    @app.get("/prefs")
+    async def prefs(request):
+        request.ctx.session.setdefault("prefs", {})
+        request.ctx.session["prefs"]["n"] = request.ctx.session["prefs"].get("n", 0) + 1
+        return response.json(request.ctx.session["prefs"])
+
+    @app.get("/bad")
+    async def bad(request):
+        request.ctx.session["when"] = {1, 2}
+        return response.json({"ok": True})
+
+    @app.get("/static/file")
+    async def static_file(request):
+        return response.text("x")
+
+    @app.get("/static/write")
+    async def static_write(request):
+        request.ctx.session["n"] = 99
+        return response.text("x")
+
+    @app.middleware("response")
+    async def app_header(request, res):
+        res.headers["X-App"] = "1"
+
+    return app
+
+
+async def test_nested_changes_are_saved(backend):
+    interface = make_interface(backend)
+    app = add_routes(make_app(interface), interface)
+    sid = sid_of(await get(app, "/cart"))
+    assert (await get(app, "/cart", sid)).json == [1, 1]
+    assert (await get(app, "/get", sid)).json == {"cart": [1, 1]}
+    await get(app, "/prefs", sid)
+    await get(app, "/prefs", sid)
+    assert (await get(app, "/get", sid)).json["prefs"] == {"n": 2}
+
+
+async def test_saved_time_is_hidden_from_the_application(backend):
+    interface = make_interface(backend)
+    app = make_app(interface)
+    sid = sid_of(await get(app, "/set"))
+    stored = json.loads(await interface._get_value(interface.prefix + sid))
+    assert set(stored) == {"n", SAVED_AT_KEY}
+    assert (await get(app, "/get", sid)).json == {"n": 1}
+
+
+async def test_value_that_is_not_json_gives_500_and_keeps_app_headers(backend, caplog):
+    interface = make_interface(backend)
+    app = add_routes(make_app(interface), interface)
+    sid = sid_of(await get(app, "/set"))
+    res = await get(app, "/bad", sid)
+    assert res.status == 500
+    assert res.headers.get("X-App") == "1"
+    assert not set_cookie(res)
+    assert "'when'" in caplog.text
+    assert (await get(app, "/get", sid)).json == {"n": 1}
+
+
+async def test_active_session_slides_expiry():
+    interface = InMemorySessionInterface(expiry=2)
+    assert interface.refresh_interval == 0.2
+    app = make_app(interface)
+    sid = sid_of(await get(app, "/set"))
+    refreshed = False
+    for _ in range(4):
+        time.sleep(0.9)
+        res = await get(app, "/get", sid)
+        assert res.json == {"n": 1}
+        refreshed = refreshed or "Max-Age=2" in set_cookie(res)
+    assert refreshed
+
+
+async def test_refresh_interval_zero_expires_from_last_change():
+    app = make_app(InMemorySessionInterface(expiry=1, refresh_interval=0))
+    sid = sid_of(await get(app, "/set"))
+    time.sleep(0.6)
+    res = await get(app, "/get", sid)
+    assert res.json == {"n": 1} and not set_cookie(res)
+    time.sleep(0.6)
+    assert (await get(app, "/get", sid)).json == {}
+
+
+async def test_session_within_refresh_interval_is_not_rewritten(backend):
+    interface = make_interface(backend, refresh_interval=60)
+    app = make_app(interface)
+    sid = sid_of(await get(app, "/set"))
+
+    async def fail(*args):
+        raise AssertionError("store written")
+
+    interface._set_value = fail
+    assert (await get(app, "/get", sid)).status == 200
+
+
+async def test_store_error_keeps_app_headers():
+    interface = InMemorySessionInterface()
+    app = add_routes(make_app(interface), interface)
+
+    async def broken(*args):
+        raise ConnectionRefusedError("store down")
+
+    interface._set_value = broken
+    res = await get(app, "/set")
+    assert res.status == 503
+    assert res.headers.get("X-App") == "1"
+    assert res.headers.get("content-type", "").startswith("text/plain")
+    assert "unavailable" in res.text
+    assert not set_cookie(res)
+
+
+async def test_on_store_error_hook_gives_the_response():
+    interface = InMemorySessionInterface()
+    app = Sanic(f"hook_{time.time_ns()}")
+    seen = []
+
+    async def hook(request, exc):
+        seen.append(type(exc))
+        return response.json({"error": exc.message}, status=exc.status)
+
+    Session(app, interface=interface, on_store_error=hook)
+
+    @app.get("/set")
+    async def set_(request):
+        request.ctx.session["n"] = 1
+        return response.text("x")
+
+    async def broken(*args):
+        raise ConnectionRefusedError("store down")
+
+    interface._set_value = broken
+    res = await get(app, "/set")
+    assert res.status == 503 and res.json["error"].startswith("The session store")
+    assert seen == [SessionStoreError]
+
+
+@memcached_only
+async def test_cas_refuses_a_save_over_a_newer_session():
+    interface = make_interface("memcache", cas=True)
+    app = make_app(interface)
+
+    @app.get("/race")
+    async def race(request):
+        # another request saves the session while this one runs
+        key = interface.prefix + request.ctx.session.sid
+        await interface._set_value(key, '{"n":100}')
+        request.ctx.session["n"] = 2
+        return response.text("x")
+
+    sid = sid_of(await get(app, "/set"))
+    res = await get(app, "/race", sid)
+    assert res.status == 409 and not set_cookie(res)
+    assert (await get(app, "/get", sid)).json == {"n": 100}
+    # without a conflict cas saves normally
+    assert (await get(app, "/set", sid)).json == {"n": 101}
+    assert (await get(app, "/get", sid)).json == {"n": 101}
+
+
+@pytest.mark.parametrize(
+    "ignore", ["/static/", ("/static/", "/favicon.ico"), lambda r: "static" in r.path]
+)
+async def test_ignored_paths_do_not_use_the_store(ignore, caplog):
+    interface = InMemorySessionInterface()
+    app = Sanic(f"ignore_{time.time_ns()}")
+    Session(app, interface=interface, ignore=ignore)
+    add_routes(app, interface)
+
+    @app.get("/set")
+    async def set_(request):
+        request.ctx.session["n"] = 1
+        return response.text("x")
+
+    sid = sid_of(await get(app, "/set"))
+
+    async def fail(*args):
+        raise AssertionError("store used")
+
+    real_get = interface._get_value
+    interface._get_value = interface._set_value = interface._delete_key = fail
+    res = await get(app, "/static/file", sid)
+    assert res.status == 200 and not set_cookie(res)
+    res = await get(app, "/static/write", sid)
+    assert res.status == 200 and not set_cookie(res)
+    assert "ignored path" in caplog.text
+    assert json.loads(await real_get(interface.prefix + sid))["n"] == 1
+
+
+async def test_read_failure_keeps_the_stored_session():
+    interface = InMemorySessionInterface()
+    app = make_app(interface)
+    sid = sid_of(await get(app, "/set"))
+    real_get = interface._get_value
+
+    async def broken(*args):
+        raise TimeoutError("slow store")
+
+    interface._get_value = broken
+    res = await get(app, "/get", sid)
+    assert res.status == 200 and res.json == {} and not set_cookie(res)
+    # a change cannot be saved over the session it could not read
+    res = await get(app, "/set", sid)
+    assert res.status == 503 and not set_cookie(res)
+    interface._get_value = real_get
+    assert (await get(app, "/get", sid)).json == {"n": 1}
+
+
+async def test_regenerate_after_read_failure_saves_and_drops_old_id():
+    interface = InMemorySessionInterface()
+    app = make_app(interface)
+    old = sid_of(await get(app, "/set"))
+    real_get = interface._get_value
+
+    async def broken(*args):
+        raise TimeoutError("slow store")
+
+    interface._get_value = broken
+    res = await get(app, "/regenerate", old)
+    new = sid_of(res)
+    assert res.status == 200 and new != old
+    interface._get_value = real_get
+    assert await interface._get_value(interface.prefix + old) is None
+
+
+async def test_old_id_is_kept_when_the_regenerated_save_fails():
+    interface = InMemorySessionInterface()
+    app = make_app(interface)
+    old = sid_of(await get(app, "/set"))
+    real_set = interface._set_value
+
+    async def broken(*args):
+        raise ConnectionRefusedError("store down")
+
+    interface._set_value = broken
+    res = await get(app, "/regenerate", old)
+    assert res.status == 503 and not set_cookie(res)
+    interface._set_value = real_set
+    assert (await get(app, "/get", old)).json == {"n": 1}
+
+
+async def test_in_memory_warns_with_several_workers(caplog):
+    await _warn_in_memory_workers(SimpleNamespace(state=SimpleNamespace(workers=1)))
+    assert "kept in memory" not in caplog.text
+    await _warn_in_memory_workers(SimpleNamespace(state=SimpleNamespace(workers=4)))
+    assert "4 workers" in caplog.text
+    app = Sanic(f"listeners_{time.time_ns()}")
+    Session(app)
+    assert _warn_in_memory_workers in app.listeners["main_process_start"]
