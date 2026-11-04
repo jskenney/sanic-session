@@ -23,7 +23,7 @@ __all__ = (
     "SessionSerializationError",
 )
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 # The session is opened before the application's own request middleware (so
 # they can use it) and saved before its response middleware run.
@@ -86,6 +86,8 @@ class Session:
                 (e.g. JSON), or None for the default plain-text one.  The
                 exception's ``status`` is 503 (store unavailable), 409
                 (``SessionConflictError``) or 500 (``SessionSerializationError``).
+                If the hook raises, or returns something that is not a
+                response, the default response is sent (and the problem logged).
         """
         self.interface = None
         self.ignore = ignore
@@ -126,9 +128,25 @@ class Session:
                 logger.error(f"Session save failed: {type(e).__name__}: {e}")
                 error = None
                 if self.on_store_error is not None:
-                    error = self.on_store_error(request, e)
-                    if inspect.isawaitable(error):
-                        error = await error
+                    # A failing hook must not leave the original response in
+                    # place: fall back to the default error response
+                    try:
+                        error = self.on_store_error(request, e)
+                        if inspect.isawaitable(error):
+                            error = await error
+                    except Exception as hook_error:
+                        logger.error(
+                            "on_store_error failed, sending the default error: "
+                            f"{type(hook_error).__name__}: {hook_error}"
+                        )
+                        error = None
+                    if error is not None and not isinstance(error, HTTPResponse):
+                        logger.error(
+                            "on_store_error returned "
+                            f"{type(error).__name__}, not a response: sending the "
+                            "default error"
+                        )
+                        error = None
                 if error is None:
                     error = text(e.message, status=e.status)
                 return _replace_response(response, error)

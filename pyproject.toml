@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sanic-session"
-version = "0.10.0"
+version = "0.10.1"
 description = "Server-backed sessions for Sanic, stored in memcached or in memory."
 readme = "README.md"
 license = "MIT"
