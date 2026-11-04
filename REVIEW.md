@@ -1,165 +1,132 @@
-# sanic-session fork: Review (second pass, v0.9.0)
+# sanic-session fork: Review (third pass, v0.10.0)
 
-Reviewed: `main` / tag `v0.9.0` at `fbcb14c` (2026-10-20). That is fix batch 5 (#1); there are no newer commits on this repository.
+Reviewed: `main` / tag `v0.10.0` at `4c28b01` (2026-11-04), for use with modular-sanic.
 
-This pass focuses on **performance, bugs, runtime errors, architecture/design, and project health**, for use with modular-sanic.
+This pass covers bugs, runtime errors, security, design, performance and health, as before. It also adds **§4 Enhancement opportunities**.
 
 Tags:
-- **[verified]**: reproduced with Sanic 25.12.1, either through modular-sanic's live instance or a small sanic-testing app.
+- **[verified]**: reproduced with Sanic 25.12.1 (sanic-testing, and modular-sanic's live instance).
 - **[measured]**: has numbers.
 - **[reasoned]**: from reading the code.
 
 No package code was changed.
 
-## 1. What the fork is now
+## 1. Where the project stands
 
-There are 5 modules, about 450 lines:
+The fork is small: 5 modules, about 820 lines, plus 66 tests. Since the first review it has gained:
+- random-only session ids and `regenerate()`;
+- saving only when the session changed, including nested values;
+- JSON errors that keep the app's headers;
+- an `ignore` option for paths that need no session;
+- check-and-set (`cas`) for memcached;
+- sliding expiry;
+- CI on Python 3.10 to 3.14.
 
-- **`base.py`:**
-  - `SessionDict` is a `CallbackDict` that sets `modified` on top-level changes;
-  - `BaseSessionInterface` provides `open`, `regenerate`, `save` and the cookie helpers.
-- **`memcache.py`:** aiomcache, with the TTL capped at 30 days.
-- **`memory.py`:** `ExpiringDict`.
-- **`__init__.py`:** `Session` registers two middleware:
-  - open at request priority 1000;
-  - save at response priority -1000;
-  - a `SessionStoreError` in save is turned into a plain-text 503.
+modular-sanic uses all of it.
 
-**Request flow:**
-1. **open:** read the cookie; if it is a 32-hex id, `get` it from the store; a missing or bad entry gives a new id.
-2. **handler.**
-3. **save:** only when `modified`. An empty session is deleted and its cookie removed. Otherwise the whole dict is written as JSON and `Set-Cookie` is sent.
+The one serious problem is in the newest feature: the sliding-expiry refresh can overwrite a concurrent change (H-1). The rest are health items and enhancements.
 
-## 2. Tool and test results
+## 2. Checks run
 
 | Check | Result |
 |---|---|
-| `pytest` (46 tests, memory and memcached) | All pass. One DeprecationWarning, from `websockets.legacy` inside Sanic, not from this package. |
-| `ruff check sanic_session tests` | Clean. |
-| GitHub Actions "Tests" (Python 3.10–3.14 with a memcached service) | Green on `fixes-batch-5`, `main` and `v0.9.0` (runs 1–4). |
-| modular-sanic regression probes with v0.9.0 | Passing, apart from fixture gaps; see modular-sanic REVIEW.md §2. |
-| Store traffic (modular-sanic, memcached stats) | 0 sets for requests that don't change the session (was 1 per response before v0.9.0). 1 `get` for **every** request carrying the cookie, including static files. |
+| `pytest` (66 tests, memory and memcached) | All pass. Coverage **94%** (372 statements). One upstream DeprecationWarning (`websockets.legacy`, from Sanic). |
+| `ruff check sanic_session tests example` | Clean. |
+| `bandit -r sanic_session` | No findings. |
+| GitHub Actions "Tests" on `main` | Green (run 8, `4c28b01`). |
+| modular-sanic `main` with v0.10.0 | All its regression probes pass, apart from fixture gaps (see modular-sanic REVIEW.md §2). |
+| Refresh race, see H-1 | Reproduced on both backends. |
 
 ## 3. Findings
 
 ### HIGH
 
-#### H-1. In-place changes to nested values are silently lost **[verified]**
+#### H-1. The sliding-expiry refresh writes stale data over a concurrent change, and with `cas=True` gives read-only requests a 409 **[verified]**
 
-"Save only when modified" (v0.9.0, M-1) relies on `CallbackDict`, which only sees **top-level** changes such as `__setitem__`, `pop` and `update`. Code like this changes the stored list without the dict noticing:
+Since v0.10.0, `save()` rewrites an **unchanged** session once `refresh_interval` has passed, so active sessions don't expire (`base.py`, `refresh = session.stored and ...`). It writes the data **as this request loaded it**.
 
-```python
-cart = request.ctx.session.setdefault("cart", [])
-cart.append(item)                      # or session["prefs"]["theme"] = "dark"
-```
+Reproduced with two overlapping requests on one session (`refresh_interval=0.01`):
 
-So `modified` stays False and nothing is written.
+1. A slow read-only request loads `{"n": 1}`.
+2. A second request changes `n` to 2 and saves.
+3. The read-only request finishes and refreshes, writing `{"n": 1}` back.
 
-**Reproduced through modular-sanic with a two-route extension:**
-- the first `/api/cart/add` returns `[1]` (the key is new, so the session saves);
-- the second returns `[1, 2]`, but `/api/cart/show` then returns `[1]`.
+Afterwards `n` is **1** (it should be 2). With `refresh_interval=0` the change survives.
 
-The handler sees the change, the client is told it worked, and it is gone on the next request.
+With memcached and `cas=True`, the refresh write uses the token from the read. So the **read-only request fails with 409 Conflict**, though it changed nothing.
 
-Before v0.9.0 this worked, because every response rewrote the store. It is a silent data-loss regression for any extension that keeps lists or dicts in the session. modular-sanic's own code only assigns top-level keys, so it isn't affected.
+Before v0.10.0, read-only requests never wrote, so this window didn't exist. The fork's README says the last write wins between overlapping *changing* requests, but this adds losses caused by requests that change nothing.
 
-**Fix (small, keeps the write savings):**
-1. In `open()`, keep the raw stored string on the session (`session_dict._loaded = val`).
-2. In `save()`, serialize first. Write when `session.modified` **or** `val != session._loaded`. Skip only when both say unchanged.
+For modular-sanic the effect is small: `verify()` writes `visit` every minute, and its refresh interval is 16.8 hours. For any other app it's silent data loss.
 
-This costs one `json.dumps` per request that has a stored session (microseconds for typical sessions) and no extra store traffic. Add a test for `setdefault(...).append(...)` and for nested-dict changes, for both backends.
+**Fix:** a refresh must never overwrite a newer value:
+- **memcached:** always do refresh writes with `gets`/`cas`, even when `cas=False`. When the `cas` fails, **skip the refresh silently**: another request has just written the session, which refreshed it anyway. Never return 409 for a refresh.
+- **In-memory:** write only if the stored string still equals the one loaded (one event loop, so this is atomic).
+- **Tests:** add both scenarios: a concurrent read and write keeps the write, and a refresh under `cas=True` returns 200.
 
 ### MEDIUM
 
-#### M-1. The 503 for a store write failure skips the app's response middleware, and reveals a successful logon **[verified]**
+#### M-1. CI doesn't test the minimum Sanic version the package claims **[reasoned]**
 
-`__init__.py:44-57`. `save_session` runs first among the response middleware (priority -1000) and **returns a new response**, so Sanic runs no further response middleware.
+`pyproject.toml` says `sanic>=23.3`. CI installs the latest Sanic only. Version 0.10.0 was tested on Sanic 23.3 by hand once (66 passed). But `_replace_response` relies on `HTTPResponse` internals (`headers.clear()`, the `body` setter), and the cookie code on `add_cookie` signatures, which changed between Sanic releases.
 
-With memcached stopped, modular-sanic's 503 had only `content-length`, `connection` and `content-type`. It had:
-- no `Content-Security-Policy`;
-- no `X-Frame-Options`;
-- no `nosniff`;
-- no HSTS.
+**Fix:** a CI matrix row with `sanic==23.3.*` and `sanic-testing==23.3.*` (on Python 3.11), next to the latest. Or raise the minimum to what is actually tested.
 
-It is also plain text where the app speaks JSON.
+#### M-2. The in-memory store has no size limit **[reasoned]**
 
-The 503 only happens when the handler changed the session, so it tells a client that its request succeeded. For a logon, that turns an outage into a password oracle; see modular-sanic H-1.
+`ExpiringDict` purges expired entries every 60 s, but has no maximum. An app that stores sessions for anonymous visitors in memory (modular-sanic's fallback, or a library user) grows by one entry per new client until the entries expire. That is 7 days in modular-sanic, 30 by default. Each entry is small, but it's an easy memory leak under scraping.
 
-**Fix:**
-- Change the existing response in place rather than returning a new one: set `status = 503`, replace the body and content type, and drop any `Set-Cookie`. The app's middleware then still adds its headers.
-- Offer an `on_store_error(request, exc)` hook, so the app can render its own JSON body.
-- Fall back to returning a new response only for streaming responses, where the body can't be replaced.
-
-#### M-2. A value that isn't JSON-serializable loses the whole save, silently, and skips the app's headers **[verified]**
-
-`base.py:239`. `json.dumps(dict(session))` raises `TypeError` for a `set`, a `datetime`, `bytes` or a custom object. It is not a `SessionStoreError`, so:
-- Sanic logs it as a response-middleware exception;
-- the client receives the **original 200**, though nothing was saved;
-- the remaining response middleware are skipped (the test app's `X-App` header was missing).
-
-**Fix:** catch `TypeError`/`ValueError` around the `dumps` and log it as an application error naming the offending key. Either raise during the request, or treat it like a store error (M-1). Document that session values must be JSON types, or accept `dumps`/`loads` parameters.
-
-#### M-3. Expiry doesn't slide: a session that is read but not written expires while in use **[verified]**
-
-Since saves happen only on change, the store TTL and the cookie's `Max-Age` are refreshed only when something is written.
-
-With `InMemorySessionInterface(expiry=2)`, a session read every 0.9 s was gone at 2.7 s. memcached behaves the same, because `get` doesn't extend `exptime`.
-
-modular-sanic hides this today: `verify()` rewrites `visit` once a minute. Any other app, or a modular-sanic endpoint that doesn't call `verify()`, gets absolute expiry while the docs imply idle expiry.
-
-**Fix:** add `refresh_interval` (for example `expiry // 10`):
-- store the last save time in the session (`_saved`);
-- in `save()`, also write (memcached: `touch`, which aiomcache supports, or a full write) and re-send the cookie when it is older than that.
-
-Document the choice either way.
-
-#### M-4. Every request with a session cookie reads the store, including static files **[measured]**
-
-`open()` is eager. In modular-sanic each `/index.html`, `/logon/logo.webp` or `/favicon.ico` with a cookie costs one memcached `get` (1.00 per request, measured), and so does every route that never looks at the session.
-
-A memcached `get` is fast (sub-millisecond on localhost), but it is pure overhead on asset-heavy pages, and it makes memcached a hard dependency of static files.
-
-**Fix (pick one):**
-- Add an `ignore` option (path prefixes or a predicate) that leaves those requests with a non-loading placeholder.
-- Make `SessionDict` lazy: `open()` stores only the id, and an `await request.ctx.session.load()` (or a load on first access, done by the open middleware when the route is marked) fetches the data.
-
-The first option is a small change and covers the static-file case.
+**Fix:** a `max_entries` option, default 100,000, that evicts the oldest entries (`OrderedDict`).
 
 ### LOW
 
 | ID | Where | Issue | Fix |
 |---|---|---|---|
-| L-1 | `base.py:155-174` | A transient **read** failure (timeout) gives a new empty session with a new id. If that request then changes the session (modular-sanic sets `motd` on `/auth/info`), the new id is saved and sent, and the user's real, still-stored session is replaced. That is a permanent logout from a momentary blip. | On read failure, keep the client's id and mark the session "unloaded" so `save()` skips it; only issue a new id when the id is invalid or truly absent. |
-| L-2 | `base.py:40-43`, README | Concurrent requests: the last write wins (documented). With H-1's fix the window is unchanged; it is still worth offering memcached `cas` for apps that keep counters or carts. | Optional `gets`/`cas` in `MemcacheSessionInterface`. |
-| L-3 | `base.py:182-202` | `regenerate()` deletes the old key immediately. If the later save fails (503), the user has neither the old nor the new session. Acceptable, but undocumented. | Document it, or delete the old key in `save()` after the new one is written. |
-| L-4 | `base.py:110`, `memcache.py:98`, `memory.py:39` | `_get_value(prefix, sid)` takes a `prefix` that every backend ignores in favour of `self.prefix`, while `_set_value`/`_delete_key` take the full key. The backend API is inconsistent. | `_get_value(key)` with the full key, like the others. |
-| L-5 | `__init__.py:31` | `Session(app)` without an interface silently uses the in-memory store (per worker, lost on restart). With several workers, logons appear to work, then don't. | Log a warning when the default is used and `app.state.workers > 1`. |
-| L-6 | health | The package is small, typed loosely and fully tested end-to-end; CI is green across 3.10–3.14. There is no coverage report, and no test for nested mutation (H-1), non-JSON values (M-2) or idle expiry (M-3). | Add those three tests with the fixes; optionally `pytest --cov` in CI. |
+| L-1 | `base.py` (`SAVED_AT_KEY`) | An app that sets `session["_sanic_session_saved_at"]` has it silently overwritten and then hidden on load. | Raise on that key in `__setitem__`, or store the time outside the data (see E-1's `touch` design). |
+| L-2 | releases | There is no CHANGELOG. 0.9.0 and 0.10.0 changed behaviour: status codes (503, 409, 500), the reserved key, `_get_value(key)`, and saving on nested changes. Upgrade notes exist only in commit messages. | `CHANGELOG.md`, and GitHub releases for the tags. |
+| L-3 | `__init__.py` | `on_store_error` can raise or return a non-response. If it raises, Sanic logs a response-middleware error and sends the original (now inconsistent) response. | Catch exceptions from the hook, log them, and fall back to the default 503. |
+| L-4 | docs | `docs/` (Sphinx) is accurate but isn't built or published anywhere; the README links to `configuration.rst` as source. | Build in CI and publish to GitHub Pages, or fold it into the README. |
 
-## 4. Status of findings from the first review
+## 4. Enhancement opportunities
+
+| ID | Enhancement | Why | Effort |
+|---|---|---|---|
+| **E-1** | **Safe refresh** (the H-1 fix), optionally with memcached `touch`. A refresh only extends the store expiry and re-sends the cookie, never rewriting data. The last-refresh time would then live in the cookie's own `Expires`, or in a tiny side key. | Fixes H-1, and makes refreshes cheap: no serialising, no write of the whole session. | Small |
+| **E-2** | **Lazy loading.** `request.ctx.session` loads from the store on first access, not in middleware. | `ignore` becomes unnecessary in most apps. Routes that never look at the session cost nothing, which is most API routes in an app that also uses API keys. | Medium (the session is a dict; it needs a lazy proxy, or an explicit `await request.ctx.session.load()` in middleware that accessors call) |
+| **E-3** | **A per-user session index and `revoke_user(user)`.** Optionally record `session ids for user X` (a memcached set per user, or an in-memory dict) when the app calls `interface.bind_user(request, user)`. | "Log out everywhere", and revoking sessions on password or access changes, for modular-sanic (its E-11). | Medium |
+| **E-4** | **Idle and absolute lifetimes in the library.** `idle_timeout` and `max_lifetime` options checked on load, with a hook when a session expires. | modular-sanic re-implements both (`AUTH_VALID`, `AUTH_MAX`); every app needs them. | Small |
+| **E-5** | **Session events.** `on_create`, `on_regenerate`, `on_destroy` and `on_store_error` hooks. | Audit logging (modular-sanic E-4) and metrics without subclassing. | Small |
+| **E-6** | **Pluggable serialisation and size checks.** `dumps`/`loads` options (for example orjson), and a clear `SessionStoreError` when a session is bigger than the backend allows (memcached's default item limit is 1 MB). | Speed for large sessions; a readable error instead of a backend exception. | Small |
+| **E-7** | **Typing.** Type hints throughout, `py.typed`, and mypy (or pyright) in CI. | Better editor help for extension authors; catches API drift. | Small |
+| **E-8** | **CI hardening.** The minimum-Sanic row (M-1), a coverage floor (`--cov-fail-under=90`), and Dependabot for the workflow actions. | Keeps the 94% coverage, and the version claims honest. | Small |
+| **E-9** | **Release process.** CHANGELOG (L-2), GitHub releases, and optionally publishing a wheel to a package index under a fork-specific name. | modular-sanic and its extensions pin `@v0.x.y` from git today, which needs `git` at install time (it's why modular-sanic-docker keeps git in its image). | Small |
+| **E-10** | **A concurrency-safe mode for counters and carts.** A `session.atomic(key)` helper built on `cas`: retry the change on conflict instead of failing with 409. | `cas=True` currently gives an error the app has to handle. Most apps want "retry my change". | Medium |
+
+## 5. Prioritized top 10 (issues and enhancements together)
+
+1. **H-1 / E-1:** make refresh never overwrite: cas-or-skip, or `touch`. Release 0.10.1 and tell modular-sanic to upgrade.
+2. **M-1 / E-8:** a CI row for the minimum Sanic, and a coverage floor.
+3. **M-2:** cap the in-memory store.
+4. **L-2 / E-9:** CHANGELOG and releases.
+5. **E-4:** idle and absolute lifetimes in the library.
+6. **E-3:** a per-user index and `revoke_user`, for "log out everywhere".
+7. **E-5:** session event hooks, for auditing.
+8. **E-2:** lazy loading.
+9. **L-3:** make a failing `on_store_error` hook fall back to the default 503.
+10. **E-7, E-6, L-1, L-4:** typing, serialisation options, the reserved key, published docs.
+
+## 6. Status of findings from the second review
 
 | Item | Status | Notes |
 |---|---|---|
-| H-1 permanent and over-30-day sessions deleted | **Fixed** | `expiry=0` gives a browser-session cookie; the TTL is capped at 30 days. |
-| H-2 backend and input errors give 500s or lost sessions | **Fixed** | Read errors give a new session; write errors give a 503. See the new M-1, M-2 and L-1. |
-| H-3 packaging | **Fixed** | `pyproject.toml`, `v0.9.0` tag; installed by modular-sanic from the tag. |
-| H-4 client-chosen ids, no regenerate | **Fixed** | Verified in modular-sanic (unknown id gives a new id; `regenerate` on logon). |
-| M-1 write on every response | **Fixed** | Verified: 0 sets for unchanged sessions. It introduced H-1 and M-3. |
-| M-2 in-memory store purge and lookups | **Fixed** | |
-| M-3 cookie delete flags | **Fixed** | |
-| M-4 tests, CI, release | **Fixed** | 46 tests, green CI. |
-| M-5 abandoned drivers | **Fixed** | Redis and MongoDB removed. |
-| L-1 to L-7 | **Fixed** | The L-4 concurrency note is now in the README; still listed above as L-2. |
-
-## 5. Prioritized top 10
-
-1. **H-1:** detect nested changes, by comparing against the loaded JSON, and add tests.
-2. **M-1:** keep the app's headers on the store-error 503, by changing the response in place, and add an error hook.
-3. **M-2:** handle values that aren't JSON-serializable explicitly, never as a silent 200.
-4. **M-3:** add sliding expiry (`refresh_interval` or `touch`), or document absolute expiry.
-5. **L-1:** don't replace a client's session id because of a transient read error.
-6. **M-4:** add an `ignore` option for static paths, to skip the store read.
-7. **L-6:** add tests for H-1, M-2 and M-3; add coverage in CI.
-8. **L-5:** warn when the in-memory default is used with several workers.
-9. **L-3:** document, or reorder, the regenerate delete.
-10. **L-4 and L-2:** make the backend API consistent; optional `cas`.
+| H-1 nested changes lost | **Fixed** (0.10.0) | Verified in modular-sanic: the cart keeps `[1, 2, 3]`. |
+| M-1 503 skipped the app's headers | **Fixed** | Verified: the 503 carries modular-sanic's security headers. |
+| M-2 non-JSON values | **Fixed** | 500, with the key logged. |
+| M-3 no sliding expiry | **Fixed, but with a new race** | See H-1. |
+| M-4 store read for every request | **Fixed** (`ignore`) | modular-sanic ignores static files. E-2 would generalise it. |
+| L-1 read blip replaced the session | **Fixed** | |
+| L-2 concurrency | **Fixed** (`cas=True`) | The refresh interplay is in H-1. |
+| L-3 regenerate order | **Fixed** | |
+| L-4 backend API | **Fixed** | |
+| L-5 in-memory with several workers | **Fixed** | Warning verified with 2 workers. |
+| L-6 tests and coverage | **Fixed** | 66 tests, 94%. |
